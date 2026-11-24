@@ -1,7 +1,15 @@
 "use client";
  
-import { useState } from "react";
+import { useState, useRef } from "react";
+import ReCAPTCHA from "react-google-recaptcha";
 import Link from "next/link";
+// import { useRouter } from "next/navigation";
+import { GoogleOAuthProvider, useGoogleLogin } from "@react-oauth/google";
+
+// Backend base URL (login wala route isi par chal raha hai)
+const API = "http://localhost:8080/backend";
+// .env.local se aati hai
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
  
 const navLinks = [
   "Create",
@@ -12,14 +20,69 @@ const navLinks = [
   "Learning & Support",
   "Pricing",
 ];
- 
+
+// Google ka hook provider ke andar hi chalta hai, isliye page ko wrap kiya hai
 export default function LoginPage() {
+  return (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      <LoginContent />
+    </GoogleOAuthProvider>
+  );
+}
+ 
+function LoginContent() {
+  // const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [socialLoading, setSocialLoading] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState(null);
+  const recaptchaRef = useRef(null);
+
+  // Google login: token backend ko bhejo, wapas apna token lo
+  async function socialLogin(provider, payload) {
+    setError("");
+    try {
+      setSocialLoading(true);
+      const res = await fetch(`${API}/${provider}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      console.log(`${provider} login response:`, res.status, data);
+
+      if (data.token) {
+        localStorage.setItem("token", data.token);
+        if (data.user?.name) localStorage.setItem("loggedInUser", data.user.name);
+        window.location.href = `http://localhost:3001/auth?token=${encodeURIComponent(data.token)}&name=${encodeURIComponent(data.user?.name || "")}`;
+      } else {
+        setError(data.message || "Could not sign you in. Try again.");
+      }
+    } catch (err) {
+      console.log(`${provider} login error:`, err);
+      setError("Could not reach the server. Make sure the backend is running.");
+    } finally {
+      setSocialLoading(false);
+    }
+  }
+
+  const googleLogin = useGoogleLogin({
+    onSuccess: (tokenResponse) =>
+      socialLogin("google", { accessToken: tokenResponse.access_token }),
+    onError: () => setError("Google sign-in failed. Try again."),
+  });
+
+  function handleGoogle() {
+    setError("");
+    if (!GOOGLE_CLIENT_ID) {
+      return setError("Google sign-in is not set up yet.");
+    }
+    googleLogin();
+  }
  
   async function handleSubmit(e) {
     e.preventDefault();
@@ -33,16 +96,44 @@ export default function LoginPage() {
       setError("Password must be at least 6 characters.");
       return;
     }
+    if (!captchaToken) {
+      setError("Please verify that you are not a robot.");
+      return;
+    }
  
     try {
       setLoading(true);
-      // TODO: apni API / NextAuth call yahan lagayen
-      // await signIn("credentials", { email, password, redirect: false });
-      await new Promise((r) => setTimeout(r, 800));
-    } catch {
-      setError("Email or password is incorrect.");
+      const res = await fetch("http://localhost:8080/backend/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password, captchaToken }),
+      });
+      const data = await res.json();
+      console.log("login response:", res.status, data);
+
+      if (data.success) {
+        const token = data.jwtToken || data.token;
+        if (!token) {
+          setError("Login failed. Try again.");
+          return;
+        }
+        localStorage.setItem("token", token);
+        if (data.name) localStorage.setItem("loggedInUser", data.name);
+        window.location.href = `http://localhost:3001/auth?token=${encodeURIComponent(token)}&name=${encodeURIComponent(data.name || "")}`;
+      } else {
+        setError(
+          data.error?.details?.[0]?.message ||
+            data.message ||
+            "Email or password is incorrect."
+        );
+      }
+    } catch (err) {
+      console.log("login error:", err);
+      setError("Could not reach the server. Make sure the backend is running.");
     } finally {
       setLoading(false);
+      recaptchaRef.current?.reset();
+      setCaptchaToken(null);
     }
   }
  
@@ -146,6 +237,13 @@ export default function LoginPage() {
               </Link>
             </div>
  
+            <ReCAPTCHA
+              ref={recaptchaRef}
+              sitekey={process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY}
+              onChange={(token) => setCaptchaToken(token)}
+              onExpired={() => setCaptchaToken(null)}
+            />
+ 
             {error && (
               <p
                 role="alert"
@@ -171,7 +269,9 @@ export default function LoginPage() {
  
             <button
               type="button"
-              className="flex w-full items-center justify-center gap-3 rounded-full bg-neutral-200 py-3.5 text-base font-medium text-neutral-800 transition hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+              onClick={handleGoogle}
+              disabled={socialLoading}
+              className="flex w-full items-center justify-center gap-3 rounded-full bg-neutral-200 py-3.5 text-base font-medium text-neutral-800 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
             >
               <svg width="20" height="20" viewBox="0 0 48 48" aria-hidden="true">
                 <path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.6-.4-3.9z" />
@@ -224,4 +324,3 @@ export default function LoginPage() {
     </div>
   );
 }
- 

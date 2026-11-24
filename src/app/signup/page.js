@@ -1,7 +1,19 @@
 "use client";
  
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
+import ReCAPTCHA from "react-google-recaptcha";
 import Link from "next/link";
+import { GoogleOAuthProvider, useGoogleLogin } from "@react-oauth/google";
+
+// Backend base URL (signup wala route isi par chal raha hai)
+const API = "http://localhost:8080/backend";
+// .env.local se aate hain (neeche steps mein bataya hai)
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
+const FB_APP_ID = process.env.NEXT_PUBLIC_FB_APP_ID || "";
+
+// Profile photo ki hadd (backend ki hadd se milti hui)
+const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2 MB
  
 const navLinks = [
   "Create",
@@ -29,8 +41,17 @@ const strengthMeta = [
   { label: "Good", color: "#9BE15D" },
   { label: "Strong", color: "#6BC9DB" },
 ];
- 
+
+// Google ka hook provider ke andar hi chalta hai, isliye page ko wrap kiya hai
 export default function SignupPage() {
+  return (
+    <GoogleOAuthProvider clientId={GOOGLE_CLIENT_ID}>
+      <SignupContent />
+    </GoogleOAuthProvider>
+  );
+}
+ 
+function SignupContent() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -39,10 +60,130 @@ export default function SignupPage() {
   const [agree, setAgree] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [socialLoading, setSocialLoading] = useState(false);
   const [done, setDone] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState(null);
+  const recaptchaRef = useRef(null);
+  const [avatar, setAvatar] = useState(null);
+  const [preview, setPreview] = useState("");
+  const avatarInputRef = useRef(null);
  
   const strength = getStrength(password);
   const meta = password ? strengthMeta[strength] : null;
+
+  // Facebook SDK load karna (sirf tab jab FB App ID set ho)
+  useEffect(() => {
+    if (!FB_APP_ID) return;
+    if (window.FB) return;
+
+    window.fbAsyncInit = function () {
+      window.FB.init({
+        appId: FB_APP_ID,
+        cookie: true,
+        xfbml: false,
+        version: "v21.0", // Facebook dashboard mein jo latest version ho wo daalo
+      });
+    };
+
+    if (document.getElementById("facebook-jssdk")) return;
+    const js = document.createElement("script");
+    js.id = "facebook-jssdk";
+    js.src = "https://connect.facebook.net/en_US/sdk.js";
+    js.async = true;
+    js.defer = true;
+    js.crossOrigin = "anonymous";
+    document.body.appendChild(js);
+  }, []);
+
+  // Profile photo chunna: type aur size check, phir preview dikhana
+  function handleAvatar(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      setError("Photo must be a JPG, PNG or WEBP image.");
+      e.target.value = "";
+      return;
+    }
+    if (file.size > MAX_AVATAR_SIZE) {
+      setError("Photo must be 2 MB or smaller.");
+      e.target.value = "";
+      return;
+    }
+
+    setError("");
+    if (preview) URL.revokeObjectURL(preview);
+    setAvatar(file);
+    setPreview(URL.createObjectURL(file));
+  }
+
+  function removeAvatar() {
+    if (preview) URL.revokeObjectURL(preview);
+    setAvatar(null);
+    setPreview("");
+    if (avatarInputRef.current) avatarInputRef.current.value = "";
+  }
+
+  // Google aur Facebook dono ka common function
+  async function socialLogin(provider, payload) {
+    setError("");
+    try {
+      setSocialLoading(true);
+      const res = await fetch(`${API}/${provider}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+
+      if (data.token) {
+        localStorage.setItem("token", data.token);
+        setName(data.user?.name || "");
+        setDone(true);
+      } else {
+        setError(data.message || "Could not sign you in. Try again.");
+      }
+    } catch (err) {
+      console.log(`${provider} login error:`, err);
+      setError("Could not reach the server. Make sure the backend is running.");
+    } finally {
+      setSocialLoading(false);
+    }
+  }
+
+  const googleLogin = useGoogleLogin({
+    onSuccess: (tokenResponse) =>
+      socialLogin("google", { accessToken: tokenResponse.access_token }),
+    onError: () => setError("Google sign-in failed. Try again."),
+  });
+
+  function handleGoogle() {
+    setError("");
+    if (!GOOGLE_CLIENT_ID) {
+      return setError("Google sign-in is not set up yet.");
+    }
+    googleLogin();
+  }
+
+  function handleFacebook() {
+    setError("");
+    if (!FB_APP_ID) return setError("Facebook sign-in is not set up yet.");
+    if (!window.FB)
+      return setError("Facebook is still loading. Try again in a moment.");
+
+    window.FB.login(
+      (response) => {
+        if (response.authResponse) {
+          socialLogin("facebook", {
+            accessToken: response.authResponse.accessToken,
+          });
+        } else {
+          setError("Facebook sign-in was cancelled.");
+        }
+      },
+      { scope: "public_profile,email" }
+    );
+  }
  
   async function handleSubmit(e) {
     e.preventDefault();
@@ -56,17 +197,43 @@ export default function SignupPage() {
     if (password !== confirm) return setError("Passwords do not match.");
     if (!agree)
       return setError("Accept the terms and privacy policy to continue.");
+    if (!captchaToken)
+      return setError("Please verify that you are not a robot.");
  
     try {
       setLoading(true);
-      // TODO: apni API yahan lagayen
-      // await fetch("/api/signup", { method: "POST", body: JSON.stringify({ name, email, password }) });
-      await new Promise((r) => setTimeout(r, 900));
-      setDone(true);
-    } catch {
-      setError("Could not create your account. Try again.");
+
+      // Photo bhejne ke liye JSON ki jagah FormData use hota hai.
+      // Content-Type header khud browser lagata hai, isliye yahan nahi likhna.
+      const formData = new FormData();
+      formData.append("name", name);
+      formData.append("email", email);
+      formData.append("password", password);
+      formData.append("captchaToken", captchaToken);
+      if (avatar) formData.append("avatar", avatar);
+
+      const res = await fetch("http://localhost:8080/backend/signup", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        setDone(true);
+      } else {
+        setError(
+          data.error?.details?.[0]?.message ||
+            data.message ||
+            "Could not create your account. Try again."
+        );
+      }
+    } catch (err) {
+      console.log("signup error:", err);
+      setError("Could not reach the server. Make sure the backend is running.");
     } finally {
       setLoading(false);
+      recaptchaRef.current?.reset();
+      setCaptchaToken(null);
     }
   }
  
@@ -196,7 +363,9 @@ export default function SignupPage() {
               >
                 <button
                   type="button"
-                  className="flex items-center justify-center gap-3 rounded-full bg-neutral-200 py-3.5 text-base font-medium text-neutral-800 transition hover:-translate-y-0.5 hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                  onClick={handleGoogle}
+                  disabled={socialLoading}
+                  className="flex items-center justify-center gap-3 rounded-full bg-neutral-200 py-3.5 text-base font-medium text-neutral-800 transition hover:-translate-y-0.5 hover:bg-white disabled:cursor-not-allowed disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
                 >
                   <svg width="20" height="20" viewBox="0 0 48 48" aria-hidden="true">
                     <path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.6-.4-3.9z" />
@@ -209,7 +378,9 @@ export default function SignupPage() {
  
                 <button
                   type="button"
-                  className="flex items-center justify-center gap-3 rounded-full bg-[#1877F2] py-3.5 text-base font-medium text-white transition hover:-translate-y-0.5 hover:bg-[#3b8cff] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                  onClick={handleFacebook}
+                  disabled={socialLoading}
+                  className="flex items-center justify-center gap-3 rounded-full bg-[#1877F2] py-3.5 text-base font-medium text-white transition hover:-translate-y-0.5 hover:bg-[#3b8cff] disabled:cursor-not-allowed disabled:opacity-70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
                 >
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="#fff" aria-hidden="true">
                     <path d="M24 12.07C24 5.4 18.63 0 12 0S0 5.4 0 12.07c0 6.02 4.39 11.01 10.13 11.93v-8.44H7.08v-3.49h3.05V9.41c0-3.02 1.79-4.69 4.53-4.69 1.31 0 2.69.24 2.69.24v2.97h-1.51c-1.49 0-1.96.93-1.96 1.88v2.26h3.33l-.53 3.49h-2.8V24C19.61 23.08 24 18.09 24 12.07z" />
@@ -234,6 +405,67 @@ export default function SignupPage() {
                 className="pm-rise mt-5 space-y-4"
                 style={{ animationDelay: "320ms" }}
               >
+                {/* Profile photo (optional) */}
+                <div className="flex items-center gap-4">
+                  <label htmlFor="avatar" className="cursor-pointer">
+                    <span className="flex h-20 w-20 items-center justify-center overflow-hidden rounded-full bg-white/20 ring-2 ring-white/40">
+                      {preview ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={preview}
+                          alt="Profile preview"
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <svg
+                          width="36"
+                          height="36"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="#fff"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden="true"
+                        >
+                          <circle cx="12" cy="8" r="4" />
+                          <path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8" />
+                        </svg>
+                      )}
+                    </span>
+                  </label>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <label
+                        htmlFor="avatar"
+                        className="cursor-pointer rounded-full bg-white/20 px-4 py-2 text-sm font-medium transition hover:bg-white/30"
+                      >
+                        {preview ? "Change photo" : "Add profile photo"}
+                      </label>
+                      {preview && (
+                        <button
+                          type="button"
+                          onClick={removeAvatar}
+                          className="text-sm text-white/80 underline hover:text-white"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                    <p className="mt-1 text-xs text-white/70">
+                      JPG, PNG or WEBP, up to 2 MB (optional)
+                    </p>
+                  </div>
+                  <input
+                    id="avatar"
+                    ref={avatarInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    onChange={handleAvatar}
+                    className="sr-only"
+                  />
+                </div>
+
                 <div>
                   <label htmlFor="name" className="sr-only">Full name</label>
                   <input
@@ -335,6 +567,13 @@ export default function SignupPage() {
                   </span>
                 </label>
  
+                <ReCAPTCHA
+                  ref={recaptchaRef}
+                  sitekey={process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY}
+                  onChange={(token) => setCaptchaToken(token)}
+                  onExpired={() => setCaptchaToken(null)}
+                />
+ 
                 {error && (
                   <p
                     role="alert"
@@ -396,4 +635,3 @@ export default function SignupPage() {
     </div>
   );
 }
- 
